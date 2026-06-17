@@ -1,0 +1,866 @@
+# =====================================
+# MERGED HYBRID PIPELINE
+# Stage 1  = Pipeline 2 best part (LightGBM classification)
+# Stage 2  = Pipeline 1 best part (RandomForest regression)
+# Framework = Pipeline 1 next-day hourly prediction structure
+# =====================================
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from datetime import datetime, timedelta
+import sklearn
+import lightgbm
+import pandas as pd
+import numpy as np
+import math
+import warnings
+from pandas.errors import PerformanceWarning
+
+warnings.filterwarnings("ignore", category=PerformanceWarning)
+pd.set_option("display.float_format", "{:.6f}".format)
+
+PARTITION_DATE  = spark.sql("""
+SELECT max_pt('crowd_sourcing.dwd_job_dcc_task_labeling_detail_hf') AS dt
+""").collect()[0]["dt"]
+HOUR_DATE = spark.sql("""
+SELECT max_multi_pt('crowd_sourcing.dwd_job_dcc_task_labeling_detail_hf')[1] AS dt
+""").collect()[0]["dt"]
+print(PARTITION_DATE)
+print(HOUR_DATE)
+
+# =====================================
+# 0. USER-CONTROLLED ANCHOR
+# =====================================
+
+BASE_LOOKBACK_DAYS = 90
+STAGE1_THRESHOLD = 0.35
+
+partition_dt = datetime.strptime(PARTITION_DATE, "%Y%m%d")
+base_start_dt = partition_dt - timedelta(days=BASE_LOOKBACK_DAYS)
+
+BASE_START_DATE = base_start_dt.strftime("%Y%m%d")
+AS_OF_DATE_YYYYMMDD = partition_dt.strftime("%Y%m%d")
+
+print("PARTITION_DATE:", PARTITION_DATE)
+print("BASE_START_DATE:", BASE_START_DATE)
+print("AS_OF_DATE_YYYYMMDD:", AS_OF_DATE_YYYYMMDD)
+print("STAGE1_THRESHOLD:", STAGE1_THRESHOLD)
+
+# =====================================
+# 1. USER BASE
+# =====================================
+
+user_base = (
+    spark.table("startai.dim_user_user_startai_hf")
+    .filter(
+        (F.col("date") == F.expr("max_pt('startai.dim_user_user_startai_hf')")) &
+        (F.col("hour") == F.expr("max_multi_pt('startai.dim_user_user_startai_hf')[1]")) &
+        (F.col("status") == 1) &
+        (F.col("user_source") == "Crowdsourcing")
+    )
+    .select(
+        "user_id",
+        F.lower(F.trim("user_email")).alias("user_email"),
+        "startai_department_name",
+        "user_source"
+    )
+    .dropDuplicates(["user_id"])
+)
+
+user_pool = user_base.select("user_id").dropDuplicates()
+
+user_base.cache()
+user_pool.cache()
+
+# =====================================
+# 2. PULL TASK DATA
+# Use the more robust timestamp logic from pipeline 1
+# =====================================
+
+task_df = (
+    spark.table("crowd_sourcing.dwd_job_dcc_task_labeling_detail_hf")
+    .join(user_pool, on="user_id", how="inner")
+    .filter(
+        (F.col("role_type") == "human") &
+        (F.col("action") == 1) &
+        (F.col("org_id") == 1) &
+        (F.col("date") == F.expr("max_pt('crowd_sourcing.dwd_job_dcc_task_labeling_detail_hf')")) &
+        (F.col("hour") == F.expr("max_multi_pt('crowd_sourcing.dwd_job_dcc_task_labeling_detail_hf')[1]")) &
+        (F.col("visible_submit_duration").isNotNull())
+    )
+    .withColumn("visible_submit_sec", F.col("visible_submit_duration") / 1000.0)
+    .withColumn(
+        "created_time_sec",
+        F.when(F.col("created_time") > 9999999999, F.col("created_time") / 1000.0)
+         .otherwise(F.col("created_time").cast("double"))
+    )
+    .withColumn("created_ts", F.from_unixtime("created_time_sec").cast("timestamp"))
+    .withColumn("event_ts", F.coalesce(F.col("request_time"), F.col("created_ts")))
+    .withColumn("status_date", F.date_format("event_ts", "yyyyMMdd"))
+    .withColumn("status_hour", F.hour("event_ts"))
+    .withColumn("visible_submit_sec", F.least(F.col("visible_submit_sec"), F.lit(3600.0)))
+)
+
+task_df.cache()
+
+# =====================================
+# 3. AGGREGATE TO BASE_HOURLY
+# One row per user-date-hour
+# =====================================
+
+base_hourly = (
+    task_df
+    .groupBy("user_id", "status_date", "status_hour")
+    .agg(
+        F.sum("visible_submit_sec").alias("visible_submit_sec"),
+        F.count("*").alias("hourly_task_count")
+    )
+    .withColumn("visible_submit_sec", F.least(F.col("visible_submit_sec"), F.lit(3600.0)))
+)
+
+base_hourly.cache()
+
+# =====================================
+# 4. TRIM BASE_HOURLY TO LOOKBACK WINDOW
+# Keep only recent history up to the latest available day
+# =====================================
+
+base_hourly_trimmed = (
+    base_hourly
+    .filter(
+        (F.col("status_date") >= BASE_START_DATE) &
+        (F.col("status_date") <= AS_OF_DATE_YYYYMMDD)
+    )
+)
+
+# =====================================
+# 5. CONVERT BASE_HOURLY TO PANDAS
+# =====================================
+
+pdf = base_hourly_trimmed.toPandas()
+
+print("base_hourly pandas shape:", pdf.shape)
+
+# =====================================
+# 6. BASIC CLEANUP
+# =====================================
+
+pdf["status_date"] = pdf["status_date"].astype(str)
+pdf["status_hour"] = pdf["status_hour"].astype(int)
+pdf["visible_submit_sec"] = pdf["visible_submit_sec"].astype(float)
+pdf["hourly_task_count"] = pdf["hourly_task_count"].astype(float)
+
+pdf = pdf.drop_duplicates(subset=["user_id", "status_date", "status_hour"]).copy()
+
+pdf["status_datetime"] = pd.to_datetime(
+    pdf["status_date"] + pdf["status_hour"].astype(str).str.zfill(2),
+    format="%Y%m%d%H",
+    errors="coerce"
+)
+
+pdf = pdf.sort_values(["user_id", "status_datetime"]).reset_index(drop=True)
+
+# =====================================
+# 7. BUILD FULL 24-HOUR PANEL
+# Every user-date gets 24 rows
+# =====================================
+
+user_dates = pdf[["user_id", "status_date"]].drop_duplicates().copy()
+hours = pd.DataFrame({"status_hour": np.arange(24, dtype=int)})
+
+user_dates["key"] = 1
+hours["key"] = 1
+
+panel = (
+    user_dates
+    .merge(hours, on="key", how="inner")
+    .drop(columns="key")
+)
+
+panel = panel.merge(
+    pdf,
+    on=["user_id", "status_date", "status_hour"],
+    how="left"
+)
+
+panel["visible_submit_sec"] = panel["visible_submit_sec"].fillna(0.0)
+panel["hourly_task_count"] = panel["hourly_task_count"].fillna(0.0)
+
+panel["active_hour"] = (panel["visible_submit_sec"] > 0).astype(int)
+
+panel["status_datetime"] = pd.to_datetime(
+    panel["status_date"] + panel["status_hour"].astype(str).str.zfill(2),
+    format="%Y%m%d%H",
+    errors="coerce"
+)
+
+panel = panel.sort_values(["user_id", "status_datetime"]).reset_index(drop=True)
+
+pdf = panel.copy()
+
+print("Exploded panel shape:", pdf.shape)
+print("Rows per user-date summary:")
+print(pdf.groupby(["user_id", "status_date"])["status_hour"].count().describe())
+
+# =====================================
+# 8. ADD DAILY-LEVEL FEATURES FROM PANEL
+# =====================================
+
+daily_df = (
+    pdf.groupby(["user_id", "status_date"], as_index=False)
+    .agg(
+        daily_visible_submit_sec=("visible_submit_sec", "sum"),
+        daily_task_count=("hourly_task_count", "sum")
+    )
+)
+
+# working hour mode from trimmed history
+working_hour_stats = (
+    pdf.groupby(["user_id", "status_hour"], as_index=False)
+    .agg(
+        active_hour_instances=("active_hour", "sum"),
+        avg_visible_submit_sec=("visible_submit_sec", "mean"),
+        sum_visible_submit_sec=("visible_submit_sec", "sum")
+    )
+)
+
+working_hour_stats = working_hour_stats.sort_values(
+    ["user_id", "active_hour_instances", "avg_visible_submit_sec", "sum_visible_submit_sec", "status_hour"],
+    ascending=[True, False, False, False, True]
+)
+
+working_hour_mode_df = (
+    working_hour_stats
+    .drop_duplicates(subset=["user_id"], keep="first")
+    .rename(columns={"status_hour": "working_hour_mode"})[["user_id", "working_hour_mode"]]
+)
+
+daily_df = daily_df.merge(working_hour_mode_df, on="user_id", how="left")
+
+daily_df["status_date_dt"] = pd.to_datetime(daily_df["status_date"], format="%Y%m%d")
+
+daily_df = daily_df.sort_values(["user_id", "status_date_dt"]).reset_index(drop=True)
+
+# =====================================
+# 9. DAILY LAG FEATURES
+# =====================================
+
+day_group = daily_df.groupby("user_id", sort=False)
+
+for lag in [1, 2, 3, 4, 5, 6, 7, 14]:
+    daily_df[f"daily_time_lag{lag}d"] = day_group["daily_visible_submit_sec"].shift(lag)
+    daily_df[f"daily_tasks_lag{lag}d"] = day_group["daily_task_count"].shift(lag)
+
+for window_size in [3, 7, 14]:
+    shifted_daily_time = day_group["daily_visible_submit_sec"].shift(1)
+    shifted_daily_tasks = day_group["daily_task_count"].shift(1)
+
+    daily_df[f"daily_time_roll{window_size}d_avg"] = (
+        shifted_daily_time.groupby(daily_df["user_id"]).rolling(window_size).mean().reset_index(level=0, drop=True)
+    )
+    daily_df[f"daily_time_roll{window_size}d_std"] = (
+        shifted_daily_time.groupby(daily_df["user_id"]).rolling(window_size).std().reset_index(level=0, drop=True)
+    )
+    daily_df[f"daily_tasks_roll{window_size}d_avg"] = (
+        shifted_daily_tasks.groupby(daily_df["user_id"]).rolling(window_size).mean().reset_index(level=0, drop=True)
+    )
+
+# days since last active day
+daily_df["is_active_today"] = (daily_df["daily_visible_submit_sec"] > 0).astype(int)
+daily_df["active_date_marker"] = daily_df["status_date_dt"].where(daily_df["is_active_today"] == 1)
+
+prev_active_day = (
+    daily_df["active_date_marker"]
+    .groupby(daily_df["user_id"])
+    .shift(1)
+    .groupby(daily_df["user_id"])
+    .ffill()
+)
+
+daily_df["days_since_last_active"] = (
+    (daily_df["status_date_dt"] - prev_active_day).dt.days
+)
+daily_df["days_since_last_active"] = daily_df["days_since_last_active"].fillna(999)
+
+# worked yesterday / active_days_last_7d
+daily_df["worked_yesterday"] = (daily_df["daily_time_lag1d"].fillna(0) > 0).astype(int)
+
+lag_active_cols = []
+for lag in [1, 2, 3, 4, 5, 6, 7]:
+    col = f"active_flag_lag{lag}d"
+    daily_df[col] = (daily_df[f"daily_time_lag{lag}d"].fillna(0) > 0).astype(int)
+    lag_active_cols.append(col)
+
+daily_df["active_days_last_7d"] = daily_df[lag_active_cols].sum(axis=1)
+
+daily_df["user_active_rate_7d"] = daily_df["active_days_last_7d"] / 7.0
+
+daily_df["user_active_rate_14d"] = (
+    (
+        (daily_df["daily_time_lag1d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag2d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag3d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag4d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag5d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag6d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag7d"].fillna(0) > 0).astype(int) +
+        (daily_df["daily_time_lag14d"].fillna(0) > 0).astype(int)
+    ) / 8.0
+)
+
+# =====================================
+# 10. MERGE DAILY FEATURES BACK TO HOURLY PANEL
+# =====================================
+
+pdf = pdf.merge(
+    daily_df.drop(columns=["active_date_marker"]),
+    on=["user_id", "status_date"],
+    how="left"
+)
+
+# =====================================
+# 11. CALENDAR FEATURES
+# =====================================
+
+pdf["status_date_dt"] = pd.to_datetime(pdf["status_date"], format="%Y%m%d")
+pdf["day_of_week"] = pdf["status_date_dt"].dt.dayofweek      # Monday=0
+pdf["is_weekend"] = (pdf["day_of_week"] >= 5).astype(int)
+pdf["hour_of_day"] = pdf["status_hour"].astype(int)
+
+pdf["day_of_month"] = pdf["status_date_dt"].dt.day
+pdf["week_of_year"] = pdf["status_date_dt"].dt.isocalendar().week.astype(int)
+pdf["month"] = pdf["status_date_dt"].dt.month
+pdf["is_month_start"] = (pdf["day_of_month"] <= 3).astype(int)
+pdf["is_month_end"] = (pdf["day_of_month"] >= 28).astype(int)
+
+pdf["dow_sin"] = np.sin(2 * np.pi * pdf["day_of_week"] / 7)
+pdf["dow_cos"] = np.cos(2 * np.pi * pdf["day_of_week"] / 7)
+pdf["month_sin"] = np.sin(2 * np.pi * pdf["month"] / 12)
+pdf["month_cos"] = np.cos(2 * np.pi * pdf["month"] / 12)
+
+pdf["hour_sin"] = np.sin(2 * np.pi * pdf["hour_of_day"] / 24)
+pdf["hour_cos"] = np.cos(2 * np.pi * pdf["hour_of_day"] / 24)
+pdf["is_night"] = pdf["hour_of_day"].between(0, 6).astype(int)
+pdf["is_peak"] = pdf["hour_of_day"].between(9, 17).astype(int)
+
+# =====================================
+# 12. PIPELINE 2 STYLE HOURLY FEATURES
+# =====================================
+
+group = pdf.groupby("user_id", sort=False)
+
+# lag activity
+pdf["lag_1_active"] = group["active_hour"].shift(1)
+pdf["lag_2_active"] = group["active_hour"].shift(2)
+pdf["lag_3_active"] = group["active_hour"].shift(3)
+pdf["lag_6_active"] = group["active_hour"].shift(6)
+pdf["lag_12_active"] = group["active_hour"].shift(12)
+pdf["lag_24_active"] = group["active_hour"].shift(24)
+pdf["lag_168_active"] = group["active_hour"].shift(168)
+
+# lag intensity
+pdf["lag_1_sec"] = group["visible_submit_sec"].shift(1)
+pdf["lag_24_sec"] = group["visible_submit_sec"].shift(24)
+pdf["lag_168_sec"] = group["visible_submit_sec"].shift(168)
+
+# rolling recent behavior
+shifted_active = group["active_hour"].shift(1)
+shifted_sec = group["visible_submit_sec"].shift(1)
+shifted_tasks = group["hourly_task_count"].shift(1)
+
+pdf["active_sum_last_3h"] = shifted_active.groupby(pdf["user_id"]).rolling(3).sum().reset_index(level=0, drop=True)
+pdf["active_sum_last_6h"] = shifted_active.groupby(pdf["user_id"]).rolling(6).sum().reset_index(level=0, drop=True)
+pdf["active_sum_last_12h"] = shifted_active.groupby(pdf["user_id"]).rolling(12).sum().reset_index(level=0, drop=True)
+pdf["active_sum_last_24h"] = shifted_active.groupby(pdf["user_id"]).rolling(24).sum().reset_index(level=0, drop=True)
+
+pdf["active_rate_last_6h"] = shifted_active.groupby(pdf["user_id"]).rolling(6).mean().reset_index(level=0, drop=True)
+pdf["active_rate_last_24h"] = shifted_active.groupby(pdf["user_id"]).rolling(24).mean().reset_index(level=0, drop=True)
+pdf["active_rate_last_72h"] = shifted_active.groupby(pdf["user_id"]).rolling(72).mean().reset_index(level=0, drop=True)
+pdf["active_rate_last_168h"] = shifted_active.groupby(pdf["user_id"]).rolling(168).mean().reset_index(level=0, drop=True)
+
+pdf["avg_sec_last_6h"] = shifted_sec.groupby(pdf["user_id"]).rolling(6).mean().reset_index(level=0, drop=True)
+pdf["avg_sec_last_24h"] = shifted_sec.groupby(pdf["user_id"]).rolling(24).mean().reset_index(level=0, drop=True)
+
+pdf["avg_tasks_last_6h"] = shifted_tasks.groupby(pdf["user_id"]).rolling(6).mean().reset_index(level=0, drop=True)
+pdf["avg_tasks_last_24h"] = shifted_tasks.groupby(pdf["user_id"]).rolling(24).mean().reset_index(level=0, drop=True)
+
+# recency feature
+prev_active_time = (
+    pdf["status_datetime"]
+    .where(pdf["active_hour"] == 1)
+    .groupby(pdf["user_id"])
+    .shift(1)
+    .groupby(pdf["user_id"])
+    .ffill()
+)
+
+pdf["hours_since_last_active"] = (
+    (pdf["status_datetime"] - prev_active_time).dt.total_seconds() / 3600
+)
+pdf["hours_since_last_active"] = pdf["hours_since_last_active"].clip(upper=168)
+
+# same-hour behavior
+hour_group = pdf.groupby(["user_id", "status_hour"], sort=False)
+
+pdf["same_hour_active_rate_last_7d"] = (
+    hour_group["active_hour"]
+    .shift(1)
+    .groupby([pdf["user_id"], pdf["status_hour"]])
+    .rolling(7)
+    .mean()
+    .reset_index(level=[0, 1], drop=True)
+)
+
+pdf["same_hour_avg_sec_last_7d"] = (
+    hour_group["visible_submit_sec"]
+    .shift(1)
+    .groupby([pdf["user_id"], pdf["status_hour"]])
+    .rolling(7)
+    .mean()
+    .reset_index(level=[0, 1], drop=True)
+)
+
+pdf["same_hour_avg_tasks_last_7d"] = (
+    hour_group["hourly_task_count"]
+    .shift(1)
+    .groupby([pdf["user_id"], pdf["status_hour"]])
+    .rolling(7)
+    .mean()
+    .reset_index(level=[0, 1], drop=True)
+)
+
+# same weekday-hour behavior
+pdf["weekday_hour_key"] = pdf["day_of_week"].astype(str) + "_" + pdf["status_hour"].astype(str)
+
+weekday_hour_group = pdf.groupby(["user_id", "weekday_hour_key"], sort=False)
+
+pdf["same_weekday_hour_active_rate_last_4w"] = (
+    weekday_hour_group["active_hour"]
+    .shift(1)
+    .groupby([pdf["user_id"], pdf["weekday_hour_key"]])
+    .rolling(4)
+    .mean()
+    .reset_index(level=[0, 1], drop=True)
+)
+
+pdf["same_weekday_hour_lag_1"] = weekday_hour_group["active_hour"].shift(1)
+
+# session / daily accumulation
+prev_active = group["active_hour"].shift(1).fillna(0)
+
+pdf["active_streak_before"] = (
+    prev_active.groupby(pdf["user_id"])
+    .transform(lambda s: s.groupby((s == 0).cumsum()).cumsum())
+)
+
+pdf["hours_worked_today_before"] = (
+    pdf.groupby(["user_id", "status_date"], sort=False)["active_hour"]
+    .transform(lambda s: s.cumsum().shift(1))
+)
+
+pdf["sec_worked_today_before"] = (
+    pdf.groupby(["user_id", "status_date"], sort=False)["visible_submit_sec"]
+    .transform(lambda s: s.cumsum().shift(1))
+)
+
+# hour preference score from pipeline 1 flavor
+pdf["same_hour_lag_avg_safe"] = (
+    pdf["lag_24_sec"].fillna(0.0) + pdf["lag_168_sec"].fillna(0.0)
+) / 2.0
+
+pdf["hour_preference_score"] = np.where(
+    pdf["daily_time_roll14d_avg"].fillna(0) > 0,
+    pdf["same_hour_lag_avg_safe"] / pdf["daily_time_roll14d_avg"].replace(0, np.nan),
+    0.0
+)
+pdf["hour_preference_score"] = pd.Series(pdf["hour_preference_score"]).replace([np.inf, -np.inf], 0).fillna(0)
+
+# =====================================
+# 13. FILL MISSING VALUES
+# =====================================
+
+fill_zero_cols = [
+    "lag_1_active", "lag_2_active", "lag_3_active", "lag_6_active",
+    "lag_12_active", "lag_24_active", "lag_168_active",
+    "lag_1_sec", "lag_24_sec", "lag_168_sec",
+    "active_sum_last_3h", "active_sum_last_6h", "active_sum_last_12h", "active_sum_last_24h",
+    "active_rate_last_6h", "active_rate_last_24h", "active_rate_last_72h", "active_rate_last_168h",
+    "avg_sec_last_6h", "avg_sec_last_24h", "avg_tasks_last_6h", "avg_tasks_last_24h",
+    "same_hour_active_rate_last_7d", "same_hour_avg_sec_last_7d", "same_hour_avg_tasks_last_7d",
+    "same_weekday_hour_active_rate_last_4w", "same_weekday_hour_lag_1",
+    "hours_worked_today_before", "sec_worked_today_before", "active_streak_before",
+    "daily_time_lag1d", "daily_time_lag2d", "daily_time_lag3d", "daily_time_lag4d",
+    "daily_time_lag5d", "daily_time_lag6d", "daily_time_lag7d", "daily_time_lag14d",
+    "daily_tasks_lag1d", "daily_tasks_lag2d", "daily_tasks_lag3d", "daily_tasks_lag4d",
+    "daily_tasks_lag5d", "daily_tasks_lag6d", "daily_tasks_lag7d", "daily_tasks_lag14d",
+    "daily_time_roll3d_avg", "daily_time_roll3d_std", "daily_time_roll7d_avg", "daily_time_roll7d_std",
+    "daily_time_roll14d_avg", "daily_time_roll14d_std",
+    "daily_tasks_roll3d_avg", "daily_tasks_roll7d_avg", "daily_tasks_roll14d_avg",
+    "days_since_last_active", "worked_yesterday", "active_days_last_7d",
+    "user_active_rate_7d", "user_active_rate_14d",
+    "hour_preference_score", "same_hour_lag_avg_safe"
+]
+
+for c in fill_zero_cols:
+    if c in pdf.columns:
+        pdf[c] = pdf[c].fillna(0)
+
+pdf["hours_since_last_active"] = pdf["hours_since_last_active"].fillna(999)
+pdf["working_hour_mode"] = pdf["working_hour_mode"].fillna(0)
+
+# =====================================
+# 14. TRAIN / SCORE SPLIT
+# future scoring mode:
+# - train on latest 14 days up to latest available day
+# - score tomorrow
+# =====================================
+
+pdf["status_date_dt"] = pd.to_datetime(pdf["status_date"], format="%Y%m%d")
+
+latest_ts = pdf["status_datetime"].max()
+as_of_day = latest_ts.normalize()
+score_day = as_of_day + pd.Timedelta(days=1)
+
+train_start_day = as_of_day - pd.Timedelta(days=13)
+train_end_day = as_of_day
+
+train_df = pdf[
+    (pdf["status_date_dt"] >= train_start_day) &
+    (pdf["status_date_dt"] <= train_end_day)
+].copy()
+
+# use today's full 24-hour panel as template, then shift the date to tomorrow
+test_df = pdf[
+    pdf["status_date_dt"] == as_of_day
+].copy()
+
+test_df["status_date_dt"] = score_day
+test_df["status_date"] = score_day.strftime("%Y%m%d")
+test_df["status_datetime"] = pd.to_datetime(
+    test_df["status_date"] + test_df["status_hour"].astype(str).str.zfill(2),
+    format="%Y%m%d%H",
+    errors="coerce"
+)
+
+print("Latest available timestamp :", latest_ts)
+print("As-of day                  :", as_of_day.date())
+print("Train start day            :", train_start_day.date())
+print("Train end day              :", train_end_day.date())
+print("Score day (tomorrow)       :", score_day.date())
+print("Train rows:", train_df.shape)
+print("Score rows:", test_df.shape)
+
+# =====================================
+# 14.1 REFRESH CALENDAR FEATURES FOR SCORE DAY
+# =====================================
+
+test_df["day_of_week"] = test_df["status_date_dt"].dt.dayofweek
+test_df["is_weekend"] = (test_df["day_of_week"] >= 5).astype(int)
+test_df["hour_of_day"] = test_df["status_hour"].astype(int)
+
+test_df["day_of_month"] = test_df["status_date_dt"].dt.day
+test_df["week_of_year"] = test_df["status_date_dt"].dt.isocalendar().week.astype(int)
+test_df["month"] = test_df["status_date_dt"].dt.month
+test_df["is_month_start"] = (test_df["day_of_month"] <= 3).astype(int)
+test_df["is_month_end"] = (test_df["day_of_month"] >= 28).astype(int)
+
+test_df["dow_sin"] = np.sin(2 * np.pi * test_df["day_of_week"] / 7)
+test_df["dow_cos"] = np.cos(2 * np.pi * test_df["day_of_week"] / 7)
+test_df["month_sin"] = np.sin(2 * np.pi * test_df["month"] / 12)
+test_df["month_cos"] = np.cos(2 * np.pi * test_df["month"] / 12)
+
+test_df["hour_sin"] = np.sin(2 * np.pi * test_df["hour_of_day"] / 24)
+test_df["hour_cos"] = np.cos(2 * np.pi * test_df["hour_of_day"] / 24)
+test_df["is_night"] = test_df["hour_of_day"].between(0, 6).astype(int)
+test_df["is_peak"] = test_df["hour_of_day"].between(9, 17).astype(int)
+
+# =====================================
+# 15. STAGE 1 FEATURE LIST
+# Better classifier from pipeline 2
+# =====================================
+
+stage1_feature_cols = [
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+
+    "lag_1_active",
+    "lag_2_active",
+    "lag_3_active",
+    "lag_6_active",
+    "lag_12_active",
+    "lag_24_active",
+    "lag_168_active",
+
+    "lag_1_sec",
+    "lag_24_sec",
+    "lag_168_sec",
+
+    "active_sum_last_3h",
+    "active_sum_last_6h",
+    "active_sum_last_12h",
+    "active_sum_last_24h",
+    "active_rate_last_6h",
+    "active_rate_last_24h",
+    "active_rate_last_72h",
+    "active_rate_last_168h",
+    "avg_sec_last_6h",
+    "avg_sec_last_24h",
+    "avg_tasks_last_6h",
+    "avg_tasks_last_24h",
+
+    "hours_since_last_active",
+
+    "same_hour_active_rate_last_7d",
+    "same_hour_avg_sec_last_7d",
+    "same_hour_avg_tasks_last_7d",
+
+    "same_weekday_hour_active_rate_last_4w",
+    "same_weekday_hour_lag_1",
+
+    "user_active_rate_7d",
+    "user_active_rate_14d",
+
+    "active_streak_before",
+    "hours_worked_today_before",
+    "sec_worked_today_before"
+]
+
+X_train_clf = train_df[stage1_feature_cols].copy()
+y_train_clf = train_df["active_hour"].astype(int)
+
+X_test_clf = test_df[stage1_feature_cols].copy()
+
+for col in stage1_feature_cols:
+    if X_train_clf[col].dtype.kind in ["i", "u", "b"]:
+        X_train_clf[col] = X_train_clf[col].astype("int16")
+        X_test_clf[col] = X_test_clf[col].astype("int16")
+    else:
+        X_train_clf[col] = X_train_clf[col].astype("float32")
+        X_test_clf[col] = X_test_clf[col].astype("float32")
+
+print("Stage 1 feature count:", len(stage1_feature_cols))
+print("X_train_clf shape:", X_train_clf.shape)
+print("X_test_clf shape :", X_test_clf.shape)
+print("Train positive rate:", y_train_clf.mean())
+
+# =====================================
+# 16. TRAIN STAGE 1 CLASSIFIER
+# future scoring mode
+# =====================================
+
+from lightgbm import LGBMClassifier
+
+clf_model = LGBMClassifier(
+    objective="binary",
+    n_estimators=150,
+    learning_rate=0.05,
+    num_leaves=31,
+    max_depth=8,
+    min_child_samples=50,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    n_jobs=4,
+    verbose=-1
+)
+
+print("Training Stage 1 LightGBM...")
+clf_model.fit(X_train_clf, y_train_clf)
+
+train_df["prob_online"] = clf_model.predict_proba(X_train_clf)[:, 1]
+test_df["prob_online"] = clf_model.predict_proba(X_test_clf)[:, 1]
+
+test_df["pred_class"] = (test_df["prob_online"] >= STAGE1_THRESHOLD).astype(int)
+
+print("\nTomorrow scoring sample:")
+print(test_df[[
+    "user_id",
+    "status_date",
+    "status_hour",
+    "prob_online",
+    "pred_class"
+]].head(20))
+
+# =====================================
+# 18. STAGE 2 FEATURE LIST
+# Better regressor logic from pipeline 1
+# =====================================
+
+stage2_feature_cols = [
+    "lag_24_sec",
+    "lag_168_sec",
+    "same_hour_lag_avg_safe",
+
+    "daily_time_lag1d",
+    "daily_time_lag2d",
+    "daily_time_lag3d",
+    "daily_time_lag4d",
+    "daily_time_lag5d",
+    "daily_time_lag6d",
+    "daily_time_lag7d",
+    "daily_time_lag14d",
+
+    "daily_tasks_lag1d",
+    "daily_tasks_lag2d",
+    "daily_tasks_lag3d",
+    "daily_tasks_lag4d",
+    "daily_tasks_lag5d",
+    "daily_tasks_lag6d",
+    "daily_tasks_lag7d",
+    "daily_tasks_lag14d",
+
+    "daily_time_roll3d_avg",
+    "daily_time_roll3d_std",
+    "daily_time_roll7d_avg",
+    "daily_time_roll7d_std",
+    "daily_time_roll14d_avg",
+    "daily_time_roll14d_std",
+
+    "daily_tasks_roll3d_avg",
+    "daily_tasks_roll7d_avg",
+    "daily_tasks_roll14d_avg",
+
+    "days_since_last_active",
+    "worked_yesterday",
+    "active_days_last_7d",
+    "hour_preference_score",
+
+    "hour_of_day",
+    "hour_sin",
+    "hour_cos",
+    "is_night",
+    "is_peak",
+
+    "day_of_week",
+    "day_of_month",
+    "week_of_year",
+    "month",
+    "is_weekend",
+    "is_month_start",
+    "is_month_end",
+    "dow_sin",
+    "dow_cos",
+    "month_sin",
+    "month_cos",
+
+    "working_hour_mode"
+]
+
+# =====================================
+# 19. TRAIN STAGE 2 REGRESSOR
+# Train only on active rows
+# =====================================
+
+train_reg_df = train_df[train_df["active_hour"] == 1].copy()
+
+X_train_reg = train_reg_df[stage2_feature_cols].copy()
+y_train_reg = train_reg_df["visible_submit_sec"].astype(float)
+
+X_test_reg_all = test_df[stage2_feature_cols].copy()
+
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+
+stage2_numeric_features = [c for c in stage2_feature_cols if c != "working_hour_mode"]
+stage2_categorical_features = ["working_hour_mode"]
+
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="constant", fill_value=0.0)),
+    ("scaler", StandardScaler()),
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore")),
+])
+
+preprocess_reg = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, stage2_numeric_features),
+        ("cat", categorical_transformer, stage2_categorical_features),
+    ]
+)
+
+rf_reg = RandomForestRegressor(
+    n_estimators=400,
+    max_depth=14,
+    min_samples_leaf=5,
+    min_samples_split=10,
+    max_features="sqrt",
+    bootstrap=True,
+    n_jobs=-1,
+    random_state=42
+)
+
+reg_pipeline = Pipeline(steps=[
+    ("preprocess", preprocess_reg),
+    ("model", rf_reg),
+])
+
+print("Training Stage 2 RandomForestRegressor...")
+reg_pipeline.fit(X_train_reg, y_train_reg)
+
+# =====================================
+# 20. PREDICT RAW CAPACITY + APPLY GATING
+# =====================================
+
+test_df["pred_capacity_raw"] = reg_pipeline.predict(X_test_reg_all)
+test_df["pred_capacity_raw"] = np.clip(test_df["pred_capacity_raw"].astype(float), 0.0, 3600.0)
+
+test_df["pred_capacity"] = test_df["pred_capacity_raw"] * test_df["pred_class"]
+
+# =====================================
+# 23. FINAL OUTPUT TABLE
+# =====================================
+
+threshold = STAGE1_THRESHOLD
+
+test_df["pred_class"] = (test_df["prob_online"] >= threshold).astype(int)
+test_df["pred_capacity"] = test_df["pred_capacity_raw"] * test_df["pred_class"]
+test_df["threshold"] = threshold
+
+# keep status_date as YYYYMMDD string
+test_df["status_date"] = pd.to_datetime(test_df["status_date"]).dt.strftime("%Y%m%d")
+
+final_output = test_df[[
+    "user_id",
+    "status_date",
+    "status_hour",
+    "prob_online",
+    "pred_capacity_raw",
+    "threshold",
+    "pred_class",
+    "pred_capacity",
+]].copy()
+
+final_output = final_output.sort_values(
+    ["user_id", "status_hour"]
+).reset_index(drop=True)
+
+print("\nFinal output sample:")
+print(final_output.head(20))
+
+spark_final_df = spark.createDataFrame(
+    final_output.to_dict(orient="records")
+)
+
+spark_final_df.createOrReplaceTempView("cs_hourly_prediction")
+
+spark.sql(f"""
+INSERT OVERWRITE TABLE startai.cs_hourly_pred3
+PARTITION (date = '{as_of_date}')
+SELECT
+  user_id,
+  status_date,
+  status_hour,
+  prob_online,
+  pred_capacity_raw,
+  threshold,
+  pred_class,
+  pred_capacity
+FROM cs_hourly_prediction
+""")
