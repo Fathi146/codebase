@@ -1,0 +1,336 @@
+import pandas as pd
+import numpy as np
+import json 
+import requests
+from datetime import datetime
+from pyspark.sql.functions import broadcast
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import types
+from pyspark.sql.window import Window
+# from pyspark.sql.functions import col, avg, countDistinct, when, lit, max as spark_max
+
+pd.set_option('display.max_columns', None)
+
+##### Settings:
+## For Overall
+MIN_REQUIRED_TOTAL_TASKS = 20
+
+## For GDS
+GDS_REQUIRED_AMOUNT_PCT = 0.5 ## Remove all users with insufficient GDS completed, less than 50%
+
+#### Statistical Rules:
+## For Labelling performance
+LOW_AHT_IQR_K = 2
+HIGH_SAME_ANS_RATIO_IDR_K = 1
+LOW_ACCURACY_IQR_K = 1.5
+LOW_GDS_IQR_K = 1
+
+#### Hard threshold cutoffs
+LOW_AHT_CUTOFF = 7
+HIGH_SAME_ANS_RATIO_CUTOFF = 0.95
+LOW_ACCURACY_CUTOFF = 0.3
+LOW_GDS_CUTOFF = 0.5
+MIN_GDS_CUTOFF = 30
+
+user_info_df = spark.table("startai.dim_user_user_startai_hf") \
+    .filter("""
+        date = max_pt('startai.dim_user_user_startai_hf')
+        AND hour = max_multi_pt('startai.dim_user_user_startai_hf')[1]
+    """) \
+    .withColumnRenamed("user_email", "verifier") \
+    .select(
+        "verifier",
+        "user_id",
+        "user_name",
+        "startai_team_name",
+        "user_source",
+        "hc_role",
+        "status"
+    ) \
+    .filter("verifier != ''") \
+    .filter("user_source = 'Crowdsourcing'") \
+    .filter("status = 1") \
+    .distinct()
+
+target_users_df = user_info_df.select("user_id").distinct()
+
+from pyspark.sql import functions as F
+
+user_gds_data_df = spark.table("crowd_sourcing.dwd_quality_simulate_detail_hf")\
+    .filter("""
+        date = max_pt('crowd_sourcing.dwd_quality_simulate_detail_hf')
+        AND hour = max_multi_pt('crowd_sourcing.dwd_quality_simulate_detail_hf')[1]
+        AND org_id = 1
+    """) \
+    .withColumn("target_user_id", F.col("target_user_id").cast("string"))\
+    .groupBy("target_task_id", "target_task_name", "target_user_id")\
+    .agg(
+        F.avg(F.when(F.col("action") == 1, F.col("is_answer_same")).otherwise(None)).alias("pct_gds_correct"),
+        F.countDistinct(F.when(F.col("action") == 1, F.col("target_item_id"))).alias("num_gds_done"),
+        F.countDistinct("simulate_item_id").alias("total_num_gds")
+    )\
+    .filter(F.col("num_gds_done") >= MIN_GDS_CUTOFF)\
+    .withColumnRenamed("target_task_id", "queue_id")\
+    .withColumnRenamed("target_task_name", "queue_name")\
+    .withColumnRenamed("target_user_id", "user_id")\
+    .select("queue_id", "queue_name", "user_id", "pct_gds_correct", "num_gds_done", "total_num_gds")
+
+aht_df = spark.table("startai.dm_label_verify_startai_tcs_usts_consolidated_df") \
+    .filter(f"""
+        date = max_pt('startai.dm_label_verify_startai_tcs_usts_consolidated_df')
+        AND visible_submit_duration > 0
+        AND to_date(created_time) >= date_sub(
+            to_date('${date}', 'yyyyMMdd'),
+            60
+        )
+    """) \
+    .select(
+        "queue_id",
+        "project_name",
+        "user_email",
+        "user_id",
+        "visible_submit_duration",
+        "task_id",
+        "created_time"
+    ) \
+    .withColumn(
+        "visible_submit_duration_sec",
+        F.col("visible_submit_duration") / 1000
+    ) \
+    .join(
+        broadcast(user_info_df.select("user_id").distinct()),
+        on="user_id",
+        how="inner"
+    ) \
+    .withColumnRenamed("user_email", "verifier")
+
+from pyspark.sql import functions as F, Window
+
+# =========================
+# WINDOW: keep latest record per task_id + user_email
+# =========================
+window_spec = (
+    Window
+    .partitionBy("task_id", "user_email")
+    .orderBy(F.col("date").desc(), F.col("hour").desc())
+)
+
+# =========================
+# LOAD DATA
+# =========================
+labelling_activity_df = (
+    spark.table("startai.dwd_label_verify_startai_hf")
+    .filter("date = max_pt('startai.dwd_label_verify_startai_hf')")
+    .filter("hour = max_multi_pt('startai.dwd_label_verify_startai_hf')[1]")
+    .filter("""
+        to_date(created_time) >= date_sub(
+            to_date('${date}', 'yyyyMMdd'),
+            60
+        )
+    """)
+)
+
+# =========================
+# KEEP MOST RECENT RECORD
+# =========================
+final_labelling_activity_df = (
+    labelling_activity_df
+    .withColumn("rank", F.row_number().over(window_spec))
+    .filter(F.col("rank") == 1)
+    .drop("rank")
+)
+
+# =========================
+# EXTRACT & CLEAN ANSWER
+# =========================
+final_labelling_activity_df = (
+    final_labelling_activity_df
+    .withColumn("dataMap_str", F.get_json_object("task_ans", "$.dataMap"))
+    .withColumn(
+        "cleaned_answer",
+        F.regexp_replace("dataMap_str", '"video_length":"[^"]*",?', '')
+    )
+    .withColumn(
+        "cleaned_answer",
+        F.regexp_replace("cleaned_answer", ',}', '}')
+    )
+    .select(
+        "task_id",
+        "project_id",
+        "queue_id",
+        "queue_name",
+        "cleaned_answer",
+        F.col("user_email").alias("verifier")
+    )
+)
+
+#Get same ans ratio table
+
+# Step 1: Aggregate data at the cleaned_answer level for each user
+aggregated_df = final_labelling_activity_df \
+    .join(aht_df, on=["task_id", "verifier", "queue_id"], how="left")\
+    .groupby("project_id", "project_name", "queue_id", "queue_name", "verifier", "user_id", "cleaned_answer") \
+    .agg(
+        F.count("task_id").alias("num_tasks_per_answer"),  # Count tasks for each cleaned_answer
+    )
+
+# Step 2: Use a window to rank cleaned_answer for each user based on frequency
+window = Window.partitionBy("project_id", "project_name", "queue_id", "queue_name", "verifier", "user_id") \
+            .orderBy(F.desc("num_tasks_per_answer"))
+
+# Step 3: Identify the most common cleaned_answer for each user
+most_common_df = aggregated_df \
+    .withColumn("rank", F.row_number().over(window)) \
+    .filter(F.col("rank") == 1) \
+    .select(
+        "project_id", "project_name", "queue_id", "queue_name", 
+        "verifier", "user_id", 
+        F.col("cleaned_answer").alias("most_common_answer"), 
+        F.col("num_tasks_per_answer").alias("most_common_answer_cnt"),
+    )
+
+# Step 4: Calculate task count & AHT per user per queue
+task_count_df = final_labelling_activity_df \
+    .join(aht_df, on=["task_id", "verifier", "queue_id"], how="inner")\
+    .groupby("project_id", "project_name", "queue_id", "queue_name", "verifier", "user_id") \
+    .agg(
+        F.count("task_id").alias("total_num_tasks_done"),  # Count the number of task_id
+        F.expr("percentile_approx(visible_submit_duration, 0.5)").alias("median_aht"),  # Median of visible_submit_duration
+        F.avg("visible_submit_duration").alias("avg_aht"),  # Average AHT
+    )
+
+#Step 5: Obtain same answer ratio & AHT per user per queue level
+same_ans_ratio_and_aht_df = most_common_df \
+    .join(task_count_df, on = ["project_id", "project_name", "queue_id", "queue_name", "verifier", "user_id"], how = 'inner')\
+    .withColumn(
+        "same_answers_ratio", 
+        F.col("most_common_answer_cnt") / F.col("total_num_tasks_done"),  # Percentage of most common answer
+    )
+
+# Filter out queues with low numbers of users
+
+with_min_tasks = same_ans_ratio_and_aht_df.filter(F.col("total_num_tasks_done") >= MIN_REQUIRED_TOTAL_TASKS)
+users_per_queue = with_min_tasks.groupby('queue_id').agg(F.count("verifier").alias("number_of_users"))
+few_users_queues = users_per_queue.filter(F.col("number_of_users") < 3).select("queue_id")
+same_ans_ratio_and_aht_df = same_ans_ratio_and_aht_df.join(
+    few_users_queues,
+    on="queue_id",
+    how="left_anti"
+)
+
+accuracy_df = spark.table("startai.app_label_task_log_accuracy_startai_df")\
+    .filter("date = '${date}'")\
+    .filter("audit_node = 4")\
+    .filter("""created_day >= date_sub(to_date('${date}', 'yyyyMMdd'),60)""")\
+    .groupBy("audited_user", "queue_id")\
+    .agg(
+        ((F.sum("be_post_qualified_cnt") + F.sum("be_pre_qualified_cnt")) /
+        (F.sum(F.col("be_pre_qualified_cnt") + F.col("be_pre_unqualified_cnt")))).alias("avg_accuracy_score")
+    )\
+    .withColumnRenamed("audited_user", "user_id")
+
+accuracy_df = accuracy_df.dropDuplicates(["user_id","queue_id"])
+
+# =========================
+# Queue-level AHT 10th percentile
+# =========================
+queue_aht_threshold_df = (
+    same_ans_ratio_and_aht_df
+    .filter(F.col("total_num_tasks_done") >= MIN_REQUIRED_TOTAL_TASKS)
+    .groupBy("queue_id")
+    .agg(
+        F.expr("percentile_approx(median_aht, 0.10)").alias("queue_aht_10th_percentile")
+    )
+)
+
+# =========================
+# Final base table
+# =========================
+final_df = (
+    same_ans_ratio_and_aht_df
+    .join(accuracy_df, on=["user_id", "queue_id"], how="left")
+    .join(user_gds_data_df, on=["user_id", "queue_id", "queue_name"], how="left")
+    .join(queue_aht_threshold_df, on="queue_id", how="left")
+    .join(
+        user_info_df.select(
+            "verifier", "user_id", "user_name",
+            "startai_team_name", "user_source", "hc_role"
+        ),
+        on=["verifier", "user_id"],
+        how="inner"
+    )
+    .filter(F.col("total_num_tasks_done") >= MIN_REQUIRED_TOTAL_TASKS)
+)
+
+# =========================
+# Simple detection flags
+# =========================
+all_labellers_df = (
+    final_df
+    .withColumn(
+        "is_acc_low",
+        F.when(
+            (F.col("avg_accuracy_score").isNotNull()) &
+            (F.col("avg_accuracy_score") < LOW_ACCURACY_CUTOFF),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+    .withColumn(
+        "is_gds_low",
+        F.when(
+            (F.col("pct_gds_correct").isNotNull()) &
+            (F.col("pct_gds_correct") < LOW_GDS_CUTOFF),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+    .withColumn(
+        "is_spam",
+        F.when(
+            (F.col("same_answers_ratio") >= HIGH_SAME_ANS_RATIO_CUTOFF) &
+            (
+                (F.col("median_aht") <= F.col("queue_aht_10th_percentile")) |
+                (F.col("median_aht") <= LOW_AHT_CUTOFF)
+            ),
+            F.lit(1)
+        ).otherwise(F.lit(0))
+    )
+)
+
+# =========================
+# Final selected output
+# =========================
+all_labellers_df = all_labellers_df.select(
+    # user info
+    "project_id",
+    "project_name",
+    "queue_id",
+    "queue_name",
+    "verifier",
+    "user_id",
+    "user_name",
+    "startai_team_name",
+    "user_source",
+    "hc_role",
+
+    # metrics
+    "avg_accuracy_score",
+    "pct_gds_correct",
+    "num_gds_done",
+    "total_num_gds",
+    "median_aht",
+    "avg_aht",
+    "queue_aht_10th_percentile",
+    "same_answers_ratio",
+    "most_common_answer",
+    "most_common_answer_cnt",
+    "total_num_tasks_done",
+
+    # detection flags
+    "is_acc_low",
+    "is_gds_low",
+    "is_spam"
+)
+
